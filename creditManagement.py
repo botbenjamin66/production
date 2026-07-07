@@ -139,6 +139,9 @@ def metrics(d: dict[str, pd.DataFrame]) -> dict:
     w = b["mv"] / mv
     ir_long = b["dv01"].sum() + f.loc[f["dv01"] > 0, "dv01"].sum()
     ir_hedge = s["bpv"].sum() + f.loc[f["dv01"] < 0, "dv01"].sum()
+    cw = c.dropna(subset=["spread", "nom"])                  # |notional|-weighted avg CDS par spread
+    cds_spread_avg = (float((cw["spread"] * cw["nom"].abs()).sum() / cw["nom"].abs().sum())
+                      if len(cw) and cw["nom"].abs().sum() else 0.0)
     return dict(
         mv=mv, n_bonds=len(b), n_cds=len(c), n_swaps=len(s),
         ir_long=ir_long, ir_hedge=ir_hedge, ir_net=ir_long + ir_hedge,
@@ -156,6 +159,7 @@ def metrics(d: dict[str, pd.DataFrame]) -> dict:
         spd=float((b["spd"] * w).sum()),
         spread_mv=float((b["spread"] * b["mv"]).sum()),      # Σ iSpread·MV (bp·€) → /NAV = bond spread carry
         cds_prem=float((c["spread"] * c["nom"]).sum()),      # Σ cdsSpread·notional (signed) → net CDS premium
+        cds_spread_avg=cds_spread_avg,
         fx_mv=float(b.loc[b["ccy"] != "EUR", "mv"].sum()),
         fv=float(b["nom"].sum()),
         cds_notional=float(c["nom"].sum()),
@@ -587,17 +591,22 @@ if pd.isna(NAV) or NAV == 0:
 CASH = FACTS.get("cash")
 
 CURVES = load_curves(XLSX)
-_CV_NOTE = (("Left axis: EUR swap curve from the Excel sheet (real market curve). "
+_CV_NOTE = (("Lower line: EUR swap curve from the Excel sheet (real market curve). "
              if (CURVES is not None and "swap" in CURVES.columns) else
-             "Left axis: swap fixed rates from the fund book (approx.). Add a 'curves'/'market' sheet "
+             "Lower line: swap fixed rates from the fund book (approx.). Add a 'curves'/'market' sheet "
              "with columns tenor + swap (via Bloomberg =BDH) to plot the real EUR curve. ")
-            + "Right axis: portfolio I-spread, MV-weighted per maturity bucket.")
+            + "Upper line adds the MV-weighted I-spread per bucket on top of the curve — "
+              "the shaded gap is the portfolio credit spread. Single % axis.")
 
 POS = positions(D)
 POS_VIEW = POS.assign(**{"Nom(M)": POS["Nominal"] / 1e6, "MV(M)": POS["MV"] / 1e6}).round(
     {"Mat": 1, "Nom(M)": 2, "MV(M)": 2, "Dur": 2, "DV01/BPV": 0, "Spread": 0})
 POS_COLS = ["Type", "id", "Name", "Sector", "Rtg", "Ccy", "Mat", "Nom(M)", "MV(M)",
             "Dur", "DV01/BPV", "Spread"]
+TOP10_COLS = ["Type", "Name", "Sector", "Rtg", "Ccy", "MV(M)", "Dur", "Spread"]
+# Native DataTable filter row — themed so it matches the rest instead of raw browser inputs.
+FILTER_STYLE = {"backgroundColor": ds.COLORS["background"], "color": ds.COLORS["secondary"],
+                "fontFamily": ds.FONT["family"], "fontSize": "12px", "fontStyle": "italic"}
 
 def eur(v: float, sign: bool = False) -> str:
     """Institutionelle Kurzform: 32.4 MM EUR / 400 TEUR / 950 EUR."""
@@ -911,29 +920,34 @@ def fig_spread_curve(col: str):
 
 
 def fig_rate_vs_spread():
-    """Just two lines: the EUR swap curve (%) and the portfolio credit spread (bp) across
-    maturity. Uses the 'curves'/'market' sheet (real EUR curve), else the fund-book rates."""
+    """Single %-axis: the EUR swap curve, and the portfolio yield stacked ON TOP (swap +
+    I-spread) — the shaded gap between the two lines is the credit spread. Uses the
+    'curves'/'market' sheet (real EUR curve), else the fund-book rates."""
     fig = go.Figure()
     if CURVES is not None and "swap" in CURVES.columns:
-        fig.add_scatter(name="EUR swap curve", x=CURVES["tenor"],
-                        y=pd.to_numeric(CURVES["swap"], errors="coerce"), mode="lines+markers",
-                        line=dict(color=ds.HEX["primary"], width=2.5), marker=dict(size=6),
-                        hovertemplate="%{x:.0f}y · %{y:.2f}%<extra></extra>")
+        cx = pd.to_numeric(CURVES["tenor"], errors="coerce")
+        cy = pd.to_numeric(CURVES["swap"], errors="coerce")
+        base_name = "EUR swap curve"
     else:
         s = D["swaps"].dropna(subset=["mat_y", "pay"])
         sw = s.groupby(s["mat_y"].round(1))["pay"].mean().sort_index()
-        fig.add_scatter(name="Swap fixed rate (book)", x=list(sw.index), y=sw.values,
-                        mode="lines+markers", line=dict(color=ds.HEX["primary"], width=2.5),
-                        marker=dict(size=7), hovertemplate="%{x:.1f}y · %{y:.2f}%<extra></extra>")
-    sp = _spread_term(B, "spread")
-    fig.add_scatter(name="Portfolio spread", x=[_BUCKET_MID[l] for l in sp.index], y=sp.values,
-                    mode="lines+markers", yaxis="y2",
-                    line=dict(color=ds.HEX["highlight"], width=2.5, dash="dot"),
-                    marker=dict(size=7), hovertemplate="%{x:.1f}y · %{y:.0f} bp<extra></extra>")
+        cx, cy, base_name = pd.Series(sw.index), pd.Series(sw.values), "Swap fixed rate (book)"
+    m = cx.notna() & cy.notna()
+    cx, cy = cx[m].to_numpy(float), cy[m].to_numpy(float)
+    o = np.argsort(cx); cx, cy = cx[o], cy[o]
+    fig.add_scatter(name=base_name, x=cx, y=cy, mode="lines+markers",
+                    line=dict(color=ds.HEX["primary"], width=2.5), marker=dict(size=6),
+                    hovertemplate="%{x:.1f}y · %{y:.2f}%<extra></extra>")
+    sp = _spread_term(B, "spread")                     # I-spread on top of the risk-free curve
+    sx = np.array([_BUCKET_MID[l] for l in sp.index], dtype=float)
+    port = (np.interp(sx, cx, cy) if len(cx) else np.zeros_like(sx)) + sp.values / 100.0
+    fig.add_scatter(name="Portfolio yield (swap + spread)", x=sx, y=port, mode="lines+markers",
+                    line=dict(color=ds.HEX["highlight"], width=2.5), marker=dict(size=7),
+                    fill="tonexty", fillcolor="rgba(92,114,133,.10)", customdata=sp.values,
+                    hovertemplate="%{x:.1f}y · %{y:.2f}% (spread %{customdata:.0f} bp)<extra></extra>")
     fig = ds.style_figure(fig, height=400, legend=True)
     fig.update_layout(hovermode="x unified", xaxis_title="Maturity (y)",
-                      yaxis=dict(title="Rate (%)", gridcolor=ds.HEX["border"], zeroline=False),
-                      yaxis2=dict(title="Spread (bp)", overlaying="y", side="right", showgrid=False))
+                      yaxis=dict(title="Rate (%)", gridcolor=ds.HEX["border"], zeroline=False))
     return legend_right(fig)
 
 
@@ -1180,15 +1194,16 @@ def overview_board():
             stat("CS01 CDS", f"{fmt(M['cs01_cds'])} €/bp", "overlay", C["highlight"]),
             stat("Avg I-Spread", f"{M['spread_avg']:.0f} bp", "MV-weighted, cash book"),
             stat("Avg OAS", f"{M['oas_avg']:.0f} bp", "option-adjusted"),
+            stat("Avg CDS Spread", f"{M['cds_spread_avg']:.0f} bp", "notional-weighted, overlay", C["highlight"]),
             stat("Carry Efficiency", f"{M['spd']:.1f} bp/y", "spread per duration", C["highlight"]),
         ]),
         ds.section("Carry / Roll-through (bp of NAV)"),
         _grid([
+            stat("Total Credit Carry", f"{(M['spread_mv'] + M['cds_prem'])/NAV:.0f} bp",
+                 "bond spread + CDS premium, over risk-free"),
             stat("Bond Spread Carry", f"{M['spread_mv']/NAV:.0f} bp", "MV-weighted I-spread, % of NAV"),
             stat("CDS Premium", f"{M['cds_prem']/NAV:+.0f} bp",
                  "net running premium, sold − bought", C["highlight"]),
-            stat("Total Credit Carry", f"{(M['spread_mv'] + M['cds_prem'])/NAV:.0f} bp",
-                 "bond spread + CDS premium, over risk-free"),
         ]),
         ds.section("Exposure"),
         _grid([
@@ -1203,18 +1218,7 @@ def overview_board():
 
 
 def tab_overview():
-    return ds.container([
-        overview_board(),
-        block("Daily PnL — T-1 · T0 · T+1", [
-            ds.data_table(
-                data=PNL_DISP.to_dict("records"),
-                columns=[{"name": n, "id": i} for i, n in PNL_COLS],
-                style_data_conditional=PNL_COND, page_action="none",
-                fixed_rows={"headers": False}, style_table={**ds.TABLE_STYLE, "maxHeight": "none"}),
-            note("Bonds/CDS: daily return ≈ 5-day price change ÷ 5 (T+1 extrapolates the latest trend). "
-                 "Swaps: market value (NPV); daily change = NPV − NPV(T-1). Futures: MtM-neutral. "
-                 "Simplified projection without a market scenario.")]),
-    ], max_width=1400)
+    return ds.container([overview_board()], max_width=1400)
 
 
 def tab_rates():
@@ -1238,7 +1242,10 @@ def tab_credit():
                       figure=fig_spread_curve(SPREAD_METRICS["I-Spread"]))]),
         block("Spread Risk — CS01 ladder", chart(fig_ladder_cs(), "c2")),
         block("Hotspots", chart(fig_heatmap(B), "cr2")),
-        block("Concentration", chart(fig_issuers(B), "cr3")),
+        block("Top 10 positions", ds.data_table(
+            data=POS_VIEW.nlargest(10, "MV(M)")[TOP10_COLS].to_dict("records"),
+            columns=[{"name": c, "id": c} for c in TOP10_COLS], page_action="none",
+            fixed_rows={"headers": False}, style_table={**ds.TABLE_STYLE, "maxHeight": "none"})),
         block("Early-Warning — spread momentum quadrant", chart(fig_momentum_quadrant(B), "i3")),
         block("Spread Movers", chart(fig_movers(B), "m1")),
         block("CS01 Surface (rotatable)", chart(fig_3d_cs01_surface(), "i2")),
@@ -1261,15 +1268,6 @@ def tab_allokation():
                 fixed_rows={"headers": False}, style_table={**ds.TABLE_STYLE, "maxHeight": "none"}),
             note("Rating quotas on the cash book; net duration after swap/future hedges.")]),
         block("ESG exclusions — binding pre-trade filters", esg_grid()),
-        block(f"Fundamental screening — balance-sheet quality ({int(FUND['Flags'].gt(0).sum())} "
-              f"of {len(FUND)} names flagged)", [
-            ds.data_table(
-                data=FUND[FUND_COLS].to_dict("records"),
-                columns=[{"name": c, "id": c} for c in FUND_COLS],
-                style_data_conditional=FUND_COND, filter_action="native", page_action="none",
-                style_table={**ds.TABLE_STYLE, "maxHeight": "520px"}),
-            note("Thresholds: ND/EBITDA > 5 · FCF/Debt < 0 · Quick < 0.5 · Fixed-Charge-Cov < 2. "
-                 "Empty cells = metric not in feed. Sortable & filterable.")]),
     ], max_width=1400)
 
 
@@ -1282,26 +1280,7 @@ def tab_positionen():
                 id="pos-table", data=POS_VIEW.to_dict("records"),
                 columns=[{"name": c, "id": c} for c in POS_COLS],
                 filter_action="native", page_action="none",
-                style_table={**ds.TABLE_STYLE, "maxHeight": "560px"})]),
-        block("Portfolio Copilot — agentic Q&A over live data + web", [
-            dcc.Textarea(id="chat-input",
-                         placeholder="e.g. Which BBB names widened most, and is there fresh news on them?",
-                         style={"width": "100%", "height": "70px", "resize": "vertical",
-                                "fontFamily": ds.FONT["family"], "fontSize": "14px", "padding": "10px",
-                                "border": f"1px solid {ds.COLORS['border']}", "borderRadius": "6px",
-                                "backgroundColor": "#FFFFFF", "color": ds.COLORS["text"],
-                                "boxSizing": "border-box"}),
-            html.Div([
-                html.Button("Ask", id="chat-send", n_clicks=0, style=ds.BUTTON_STYLE),
-                html.Span("Claude Opus 4.8 agent: fetches metrics, allocations, positions, history "
-                          "and web news via tools — may take a few seconds.",
-                          style={**ds.LABEL_STYLE, "textTransform": "none", "letterSpacing": 0,
-                                 "marginLeft": "14px"}),
-            ], style={"display": "flex", "alignItems": "center", "marginTop": "10px"}),
-            dcc.Loading(type="dot", color=ds.COLORS["primary"], children=dcc.Markdown(
-                id="chat-output",
-                style={"marginTop": "14px", "fontFamily": ds.FONT["family"], "fontSize": "14px",
-                       "color": ds.COLORS["text"], "lineHeight": 1.5}))]),
+                style_filter=FILTER_STYLE, style_table={**ds.TABLE_STYLE, "maxHeight": "80vh"})]),
         block("News Radar — live web search for negative news per issuer", [
             dcc.Textarea(id="news-input",
                          value="Which issuers in the portfolio currently have bad news?",
@@ -1333,8 +1312,8 @@ def rep_table(df: pd.DataFrame):
         fixed_rows={"headers": False},
         style_data_conditional=[{"if": {"filter_query": '{' + df.columns[0] + '} = "Σ Total"'},
                                  "fontWeight": 700, "background": ds.COLORS["surface"]}],
-        style_cell={**ds.TABLE_CELL_STYLE, "fontVariantNumeric": "tabular-nums"}
-        if hasattr(ds, "TABLE_CELL_STYLE") else {"fontVariantNumeric": "tabular-nums"},
+        style_cell={**getattr(ds, "TABLE_CELL_STYLE", {}), "fontFamily": ds.FONT["family"],
+                    "fontSize": "13px", "fontVariantNumeric": "tabular-nums"},
         style_table={**ds.TABLE_STYLE, "maxHeight": "none"})
 
 
@@ -1342,9 +1321,7 @@ def tab_reporting():
     b = D["bonds"]
     cy = float((b["coupon"] * b["nom"]).sum() / b["mv"].sum() * 100)   # avg current yield %
     key = [
-        stat("Fund Volume (NAV)", eur(NAV), FUND_META["name"]),
-        stat("As of", FACTS.get("asof", "—"), f"inception {FUND_META['inception']}"),
-        stat("ISIN", FUND_META["isin"], FUND_META["company"]),
+        stat("As of", FACTS.get("asof", "—"), FUND_META["name"]),
         stat("TER", FUND_META["ter"], "p.a."),
         stat("Avg Rating (MVw)", avg_rating(b), f"{M['n_bonds']} bonds"),
         stat("WAM", f"{M['wam']:.2f} y", "avg time to maturity"),
@@ -1378,13 +1355,10 @@ def tab_reporting():
     ], max_width=1400)
 
 
-HISTORY_SERIES = {
-    "Fund Volume (NAV)": ("nav", "EUR"), "Net Duration (y)": ("dur_net", "y"),
-    "Spread Duration (y)": ("dur_gross", "y"), "CS01 Total (€/bp)": ("cs01", "€/bp"),
-    "Net DV01 (€/bp)": ("ir_net", "€/bp"), "Avg I-Spread (bp)": ("spread_avg", "bp"),
-    "Avg OAS (bp)": ("oas_avg", "bp"), "Daily PnL (EUR)": ("pnl_real", "EUR"),
-    "VaR Utilisation (%)": ("var_util", "%"), "Cash (EUR)": ("cash", "EUR"),
-}
+# Fixed set of history charts (no dropdown) — title, snapshot column, unit.
+HISTORY_PLOTS = [("Fund Volume (NAV)", "nav", "EUR"), ("Net Duration", "dur_net", "y"),
+                 ("CS01 Total", "cs01", "€/bp"), ("Avg I-Spread", "spread_avg", "bp"),
+                 ("Cash", "cash", "EUR")]
 
 
 def fig_history(col: str, unit: str):
@@ -1395,26 +1369,22 @@ def fig_history(col: str, unit: str):
                         line=dict(color=ds.HEX["primary"], width=2.5), marker=dict(size=6),
                         fill="tozeroy", fillcolor="rgba(92,114,133,.08)",
                         hovertemplate="%{x|%Y-%m-%d} · %{y:,.2f}<extra></extra>")
-    fig = ds.style_figure(fig, height=420)
+    fig = ds.style_figure(fig, height=340)
     return fig.update_layout(hovermode="x unified", yaxis_title=unit)
 
 
 def tab_history():
-    first = next(iter(HISTORY_SERIES))
-    col, unit = HISTORY_SERIES[first]
-    return ds.container([
-        block("Time series — daily fund metrics", [
-            html.Div(dropdown("hist-metric", list(HISTORY_SERIES), first, "260px"),
-                     style={"marginBottom": "8px"}),
-            dcc.Graph(id="hist-chart", config={"displaylogo": False}, figure=fig_history(col, unit)),
-            note(f"{len(load_history())} daily snapshot(s) stored in {SNAPSHOT_STORE.name}. "
-                 "History accrues automatically on every run with fresh data (one row per as-of date).")]),
-    ], max_width=1400)
+    return ds.container(
+        [block(title, chart(fig_history(col, unit), f"hist-{col}"))
+         for title, col, unit in HISTORY_PLOTS]
+        + [note(f"{len(load_history())} daily snapshot(s) stored in {SNAPSHOT_STORE.name}. "
+                "History accrues automatically on every run with fresh data (one row per as-of date).")],
+        max_width=1400)
 
 
 PF_SUBTABS = [("Overview", "overview", tab_overview),
               ("Rates", "rates", tab_rates), ("Credit", "credit", tab_credit),
-              ("Allocation", "allok", tab_allokation), ("Reporting", "report", tab_reporting),
+              ("Allocation", "allok", tab_allokation),
               ("Positions & AI", "pos", tab_positionen), ("History", "history", tab_history)]
 
 
@@ -2383,18 +2353,11 @@ def update_explorer(metric: str, dim: str):
     return fig.update_layout(hovermode="closest")
 
 
-@app.callback(Output("hist-chart", "figure"), Input("hist-metric", "value"))
-def update_history(label: str):
-    col, unit = HISTORY_SERIES.get(label, ("nav", "EUR"))
-    return fig_history(col, unit)
-
-
-@app.callback(Output("cr1", "figure"), Output("cr2", "figure"), Output("cr3", "figure"),
+@app.callback(Output("cr1", "figure"), Output("cr2", "figure"),
               Output("i3", "figure"), Output("m1", "figure"), Input("credit-src", "value"))
 def update_credit(src: str):
     cdf = credit_view(D, src)
-    return (fig_scatter(cdf), fig_heatmap(cdf), fig_issuers(cdf),
-            fig_momentum_quadrant(cdf), fig_movers(cdf))
+    return (fig_scatter(cdf), fig_heatmap(cdf), fig_momentum_quadrant(cdf), fig_movers(cdf))
 
 
 @app.callback(Output("spread-curve", "figure"), Input("spread-metric", "value"))
@@ -2593,15 +2556,6 @@ def prospectus_pdf(n, data):
 def filter_positions(art: str):
     v = POS_VIEW if art == "All" else POS_VIEW[POS_VIEW["Type"] == art]
     return v.to_dict("records")
-
-
-@app.callback(Output("chat-output", "children"),
-              Input("chat-send", "n_clicks"), State("chat-input", "value"),
-              prevent_initial_call=True)
-def answer_question(_n_clicks: int, question: str):
-    if not question or not question.strip():
-        return "_Please enter a question._"
-    return _copilot_reply(question.strip())
 
 
 @app.callback(Output("news-output", "children"),
