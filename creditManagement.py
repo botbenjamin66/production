@@ -220,6 +220,73 @@ def _first_file(*cands):
 ROOT = _project_root()
 HERE = Path(__file__).resolve().parent
 
+# ── invisible infrastructure: logging · retry · persistent cache ──────────────
+import time
+import logging
+from logging.handlers import RotatingFileHandler
+
+_LOG_DIR = HERE / "logs"
+try:
+    _LOG_DIR.mkdir(exist_ok=True)
+except Exception:
+    _LOG_DIR = Path(tempfile.gettempdir())
+log = logging.getLogger("nordix")
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    _fh = RotatingFileHandler(_LOG_DIR / "app.log", maxBytes=1_500_000, backupCount=3, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    log.addHandler(_fh)
+    log.propagate = False
+
+
+def _retry(fn, tries=3, base=0.6, exc=Exception, what=""):
+    """Call fn() with exponential backoff on transient failures. Returns fn()'s result."""
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except exc as e:
+            last = e
+            if i == tries - 1:
+                break
+            time.sleep(base * (2 ** i))
+            log.info("retry %s (%d/%d): %s", what or getattr(fn, "__name__", "call"), i + 1, tries, e)
+    raise last
+
+
+class _JsonCache:
+    """Tiny restart-surviving cache. Key: any tuple/str; value: JSON-serialisable.
+    Entries carry a YYYYMMDD stamp; stale-day entries are pruned on load so the
+    file stays small and results auto-refresh daily."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.today = None
+        self.mem = {}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.today = pd.Timestamp.today().strftime("%Y%m%d")
+            raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            self.mem = {k: v for k, v in raw.items() if v.get("d") == self.today}
+        except Exception:
+            self.mem = {}
+
+    @staticmethod
+    def _k(key):
+        return "|".join(map(str, key)) if isinstance(key, (tuple, list)) else str(key)
+
+    def get(self, key):
+        e = self.mem.get(self._k(key))
+        return e["v"] if e else None
+
+    def set(self, key, val):
+        self.mem[self._k(key)] = {"d": self.today, "v": val}
+        try:
+            self.path.write_text(json.dumps(self.mem), encoding="utf-8")
+        except Exception as e:
+            log.info("cache write failed: %s", e)
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 def _logo_uri():
     f = _first_file(os.environ.get("NAD_LOGO"), HERE / "ndxLogo.webp", ROOT / "3_env" / "ndxLogo.webp")
@@ -669,8 +736,16 @@ def _resolve_xlsx(name: str) -> str:
     return str(hit or (HERE / Path(name).name))
 
 
-XLSX = _resolve_xlsx(sys.argv[1] if len(sys.argv) > 1 else "nad.xlsx")
-PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8050
+def _arg(i, default):
+    v = sys.argv[i] if len(sys.argv) > i else None
+    return v if v and not v.startswith("-") else default
+
+
+XLSX = _resolve_xlsx(_arg(1, "nad.xlsx"))
+try:
+    PORT = int(_arg(2, 8050))
+except (TypeError, ValueError):
+    PORT = 8050
 
 
 def _empty_book() -> dict[str, pd.DataFrame]:
@@ -1049,15 +1124,18 @@ def fig_fx_exposure():
           / NAV * 100).sort_values(ascending=False)
     if not len(ex):
         return _empty_fig("100% EUR — no FX exposure.", 260)
-    hedged_ccy = set(D["fx"]["ccy"].astype(str).str.upper()) if len(D["fx"]) else set()
-    hedged = [0.0 if str(c).upper() in hedged_ccy else float(v) for c, v in ex.items()]
+    # Hedge netting needs FX-forward notionals; the fx sheet carries none, so nothing is netted.
+    hedge_pct = {}
+    hedged = [max(0.0, float(v) - hedge_pct.get(str(c).upper(), 0.0)) for c, v in ex.items()]
+    has_hedge = any(hedge_pct.values())
     fig = go.Figure()
-    fig.add_bar(name="Unhedged", x=list(ex.index), y=list(ex.values), marker_color=ds.HEX["secondary"],
-                text=[f"{v:.2f}%" for v in ex.values], textposition="outside",
-                hovertemplate="%{x}: %{y:.2f}% of NAV — unhedged<extra></extra>")
-    fig.add_bar(name="Hedged (after FX swaps)", x=list(ex.index), y=hedged, marker_color=ds.HEX["primary"],
-                text=[f"{v:.2f}%" for v in hedged], textposition="outside",
-                hovertemplate="%{x}: %{y:.2f}% of NAV — after hedges<extra></extra>")
+    fig.add_bar(name="Unhedged" if has_hedge else "FX exposure", x=list(ex.index), y=list(ex.values),
+                marker_color=ds.HEX["secondary"], text=[f"{v:.2f}%" for v in ex.values], textposition="outside",
+                hovertemplate="%{x}: %{y:.2f}% of NAV<extra></extra>")
+    if has_hedge:
+        fig.add_bar(name="Hedged (after FX swaps)", x=list(ex.index), y=hedged, marker_color=ds.HEX["primary"],
+                    text=[f"{v:.2f}%" for v in hedged], textposition="outside",
+                    hovertemplate="%{x}: %{y:.2f}% of NAV — after hedges<extra></extra>")
     fig.add_hline(y=5, line=dict(color=ds.HEX["negative"], width=1.5, dash="dash"))
     fig.add_annotation(x=1, y=5, xref="x domain", xanchor="right", yanchor="bottom",
         text="5% limit ", showarrow=False,
@@ -1227,7 +1305,7 @@ def _anthropic():
         if not os.environ.get("ANTHROPIC_API_KEY"):
             raise RuntimeError("ANTHROPIC_API_KEY not set — put a .env next to the script with "
                                "ANTHROPIC_API_KEY=sk-ant-… or set it as an environment variable.")
-        _client = anthropic.Anthropic()
+        _client = anthropic.Anthropic(max_retries=4, timeout=90.0)
     return _client
 
 
@@ -1238,6 +1316,10 @@ def note(text: str):
 
 def block(title: str, content):
     return html.Div([ds.section(title), ds.panel(content)])
+
+
+def _busy(store):
+    return dcc.Loading(type="circle", fullscreen=True, color=ds.COLORS["primary"], children=store)
 
 
 def credit_toggle():
@@ -1339,7 +1421,7 @@ def overview_board():
                  "notional, by protection side", C["highlight"]),
             stat("Net Exposure", f"{M['credit_heat']/NAV:.0%}", "credit heat / NAV"),
         ]),
-        block("fx", chart(FIGS["fx_exposure"], "fx1")),
+        ds.panel(chart(FIGS["fx_exposure"], "fx1")),
     ], style={"paddingTop": "20px"})
 
 
@@ -1453,8 +1535,7 @@ def tab_reporting():
     ], max_width=1400)
 
 
-PF_SUBTABS = [("Overview", "overview", tab_overview),
-              ("Rates", "rates", tab_rates), ("Credit", "credit", tab_credit),
+PF_SUBTABS = [("Rates", "rates", tab_rates), ("Credit", "credit", tab_credit),
               ("Positions", "pos", tab_positionen)]
 
 
@@ -1481,7 +1562,7 @@ def portfolio_analysis():
             "Portfolio data could not be loaded.",
             f"The other tabs keep working. Please check nad.xlsx "
             f"(open in Excel? moved? sheets renamed?). Technical detail: {PORTFOLIO_ERR}")
-    return _subtabs("overview", PF_SUBTABS)
+    return _subtabs("rates", PF_SUBTABS)
 
 
 CREDIT_MODES = {"Corporate": "corp", "Financial": "fin", "Insurer": "ins", "Sovereign / SSA": "sov"}
@@ -1552,25 +1633,9 @@ def _status(cid):
 
 def _iss_dropdown(cid):
     return dcc.Dropdown(id=cid, className="iss-dd", clearable=False, value="Corporate",
+                        persistence=True, persistence_type="session",
                         options=[{"label": o, "value": o} for o in CREDIT_MODES],
                         style={"flex": "0 0 190px", "fontFamily": ds.FONT["family"], "fontSize": "15px"})
-
-
-def _issuer_controls(mode_id, inp_id, btn_id, btn_label, status_id, placeholder,
-                     title=None, subtitle=None):
-    head = []
-    if title:
-        head.append(html.Div(title, style=ISS_TITLE))
-    if subtitle:
-        head.append(html.Div(subtitle, style=ISS_SUBTITLE))
-    return html.Div(head + [
-        html.Div([
-            _iss_dropdown(mode_id),
-            dcc.Input(id=inp_id, type="text", debounce=False, placeholder=placeholder, style=ISS_INPUT_BIG),
-            html.Button(btn_label, id=btn_id, n_clicks=0, style=ISS_BTN_BIG),
-        ], style=ISS_CONTROLS_ROW),
-        html.Div(_status(status_id), style={"textAlign": "center", "marginTop": "12px", "minHeight": "18px"}),
-    ], style={"maxWidth": "820px", "margin": "0 auto", "width": "100%", "paddingBottom": "26px"})
 
 
 def search_prospectus(cm, issuer):
@@ -1617,10 +1682,11 @@ def _prosp_confirm_card(cand):
 
 XAIA_DIR = Path(os.environ.get("NAD_XAIA") or (ROOT / "0_tradingVE" / "1_research" / "xaia"))
 BONDS_DIR = Path(os.environ.get("NAD_BONDS") or (ROOT / "0_tradingVE" / "1_research" / "bonds"))
-AGENT_MAX_DOCS, AGENT_MAX_BYTES = 5, 16_000_000
+ANALYST_DIR = Path(os.environ.get("NAD_ANALYST") or (ROOT / "0_tradingVE" / "1_research" / "analyst"))
+AGENT_MAX_DOCS, AGENT_MAX_BYTES = 6, 20_000_000
 
 RESTR_SYSTEM = (
-    "You are restR.-Agent, a credit strategist who speaks with the house view of XAIA Investment, a "
+    "You are restructurings, a credit strategist who speaks with the house view of XAIA Investment, a "
     "relative-value credit manager. Your lens: value lives in relative mispricings, not directional bets. You "
     "think in the CDS-cash basis, capital-structure arbitrage, spread per unit of risk (DTS), convexity, "
     "default vs. recovery, and where consensus misprices credit. You are quantitative, contrarian and "
@@ -1629,18 +1695,34 @@ RESTR_SYSTEM = (
     "answer in the attached XAIA research; where it is silent, reason from XAIA's RV framework and say so. Be "
     "concise, opinionated and specific. Answer in the user's language.")
 BOND_SYSTEM = (
-    "You are bond-Agent, a fixed-income credit analyst grounded in the attached bond research. You focus on "
-    "issuer fundamentals and their trajectory, credit quality and rating trend, covenants and structure, "
-    "seniority and recovery, sector and curve relative value, and concrete bond selection (which line, what "
-    "spread, what risk). Ground every answer in the attached research; where it is silent, reason as a "
-    "seasoned fundamental fixed-income analyst and say so. Be concise, specific and actionable. Answer in the "
-    "user's language.")
+    "You are bonds, a fixed-income bond GENERALIST. Your expertise is the mechanics and craft of bonds — NOT "
+    "issuer-specific views. You cover: bond math (yield, duration, convexity, DV01, spread, roll-down, "
+    "asset-swap); primary and secondary structuring; high-yield documentation and covenants (incurrence vs "
+    "maintenance, restricted payments, permitted liens, EBITDA add-backs, portability, drag/priority debt, "
+    "J.Crew / asset-stripping and net-short risks); seniority, recovery and waterfalls; and derivatives (CDS "
+    "mechanics, cash-CDS basis, index vs single-name, IRS and asset swaps). Ground answers in the attached "
+    "material (a high-yield covenant/structuring guide and a fixed-income trading primer). If asked something "
+    "issuer-specific (a rating rationale, a spread level, a single name), state up front that your material is "
+    "generic and you hold no issuer research, then answer generically and suggest the 'analyst' agent for a "
+    "single-name deep dive. Be concise, precise and practical. Answer in the user's language.")
+ANALYST_SYSTEM = (
+    "You are analyst, a rigorous single-issuer credit analyst in the Oaktree tradition. You deep-dive ONE "
+    "company/issuer at a time: business model and competitive moat, end-markets and cyclicality, "
+    "revenue/margin/cash-flow trajectory, leverage and coverage, liquidity runway and the maturity wall, the "
+    "capital structure and where each instrument sits (seniority, collateral, covenants, structural "
+    "subordination), refinancing and rating path, downside and recovery under stress, key catalysts, and a "
+    "clear bull vs bear. Ground every claim in the attached issuer material (annual reports, rating-agency "
+    "reports, earnings transcripts, sell-side notes, prospectuses); where the docs are silent, reason as a "
+    "seasoned analyst and flag it as un-sourced, and cite the document/page where you can. Always finish with "
+    "a crisp verdict: the single biggest risk, and whether the spread pays for it. Answer in the user's language.")
 
 AGENTS = {
-    "restr": {"name": "restR.-Agent", "dir": XAIA_DIR, "system": RESTR_SYSTEM, "docs": None},
-    "bond": {"name": "bond-Agent", "dir": BONDS_DIR, "system": BOND_SYSTEM, "docs": None},
+    "analyst": {"name": "analyst", "dir": ANALYST_DIR, "system": ANALYST_SYSTEM, "docs": None,
+                "web": True, "model": "claude-sonnet-5", "max_tokens": 2000, "web_max_uses": 4, "recency_months": 15},
+    "bond": {"name": "bonds", "dir": BONDS_DIR, "system": BOND_SYSTEM, "docs": None},
+    "restr": {"name": "restructurings", "dir": XAIA_DIR, "system": RESTR_SYSTEM, "docs": None},
 }
-AGENT_ORDER = ["bond", "restr"]
+AGENT_ORDER = ["analyst", "bond", "restr"]
 
 
 def _pdf_date(name):
@@ -1678,13 +1760,22 @@ def _agent_docs(key):
 def _agent_reply(key, hist):
     a = AGENTS.get(key) or AGENTS["restr"]
     docs = _agent_docs(key if key in AGENTS else "restr")
+    system = a["system"]
+    kw = {}
+    if a.get("web"):
+        cut = (pd.Timestamp.today() - pd.DateOffset(months=a.get("recency_months", 15))).strftime("%Y-%m-%d")
+        system += (f" Run a few web searches to ground the answer in current facts. CRITICAL: only use sources "
+                   f"published on or after {cut} (no more than {a.get('recency_months', 15)} months old) — "
+                   f"explicitly ignore older material, and cite each web source with its publication date.")
+        kw["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": a.get("web_max_uses", 4)}]
     msgs = []
     for i, mrec in enumerate(hist):
         if i == 0 and mrec["role"] == "user" and docs:
             msgs.append({"role": "user", "content": docs + [{"type": "text", "text": mrec["content"]}]})
         else:
             msgs.append({"role": mrec["role"], "content": mrec["content"]})
-    r = _anthropic().messages.create(model=BVI_MODEL, max_tokens=1100, system=a["system"], messages=msgs)
+    r = _anthropic().messages.create(model=a.get("model", BVI_MODEL), max_tokens=a.get("max_tokens", 3000),
+                                     system=system, messages=msgs, **kw)
     return "".join(b.text for b in r.content if getattr(b, "type", None) == "text").strip()
 
 
@@ -1704,74 +1795,85 @@ def xagent_box(prefix, placeholder):
                 dcc.Input(id=f"{prefix}-q", type="text", debounce=False, style=ISS_INPUT_BIG, placeholder=placeholder),
                 html.Button("Ask", id=f"{prefix}-send", n_clicks=0, style=ISS_BTN_BIG),
             ], style=ISS_CONTROLS_ROW),
-            dcc.Store(id=f"{prefix}-hist", data=[], storage_type="session"),
+            _busy(dcc.Store(id=f"{prefix}-hist", data=[], storage_type="session")),
         ]),
     ], max_width=1080)
 
 
+def _run_button(label, bid, status_id):
+    return html.Div([
+        html.Div(html.Button(label, id=bid, n_clicks=0, style=ISS_BTN_BIG),
+                 style={"textAlign": "center", "margin": "16px 0 6px"}),
+        html.Div(_status(status_id), style={"textAlign": "center", "minHeight": "18px"}),
+    ])
+
+
 def tab_iss_credit():
     return html.Div([
-        ds.panel([
-            _issuer_controls("cred-mode", "cred-input", "cred-run", "Analyze", "cred-status",
-                             "Issuer (e.g. Volkswagen AG, Deutsche Bank AG)…",
-                             title="Issuer Credit Analysis")],
-            pad="30px 30px 26px"),
+        _run_button("Analyze credit", "cred-run", "cred-status"),
         dcc.Loading(type="dot", color=ds.COLORS["primary"], children=html.Div(id="cred-output")),
-        dcc.Store(id="cred-store", storage_type="session"),
+        _busy(dcc.Store(id="cred-store", storage_type="session")),
         xagent_box("xac", "Ask about credit, a name, relative value or a basis trade…"),
     ], style={"paddingTop": "4px"})
 
 
 CREDIT_METRICS = {
     "corp": [
-        {"key": "leverage", "label": "Net Debt / EBITDA", "unit": "x", "better": "down"},
-        {"key": "ebitda_margin", "label": "EBITDA margin", "unit": "%", "better": "up"},
-        {"key": "interest_cover", "label": "EBITDA / Interest", "unit": "x", "better": "up", "band": 1},
-        {"key": "fcf_debt", "label": "FCF / Debt", "unit": "%", "better": "up", "band": 0},
-        {"key": "liquidity_cover", "label": "Liquidity / 12m maturities", "unit": "x", "better": "up", "band": 1},
+        {"key": "cash", "label": "Cash & near-cash", "unit": "€m", "better": "up", "bbg": "BS_CASH_NEAR_CASH_ITEM"},
+        {"key": "interest_cost", "label": "Interest expense", "unit": "€m", "better": "down", "bbg": "IS_INT_EXPENSE"},
+        {"key": "fcf", "label": "Free cash flow", "unit": "€m", "better": "up", "band": 0, "bbg": "CF_FREE_CASH_FLOW"},
+        {"key": "leverage", "label": "Net Debt / EBITDA", "unit": "x", "better": "down", "bbg": "NET_DEBT_TO_EBITDA"},
+        {"key": "interest_cover", "label": "EBITDA / Interest", "unit": "x", "better": "up", "band": 1, "bbg": "EBITDA_TO_INTEREST_EXPN"},
+        {"key": "ebitda", "label": "EBITDA", "unit": "€m", "better": "up", "bbg": "EBITDA"},
     ],
     "fin": [
-        {"key": "cet1", "label": "CET1 ratio", "unit": "%", "better": "up"},
         {"key": "lcr", "label": "LCR", "unit": "%", "better": "up", "band": 100},
+        {"key": "nsfr", "label": "NSFR", "unit": "%", "better": "up", "band": 100},
+        {"key": "cet1", "label": "CET1 ratio", "unit": "%", "better": "up"},
         {"key": "npl", "label": "NPL ratio", "unit": "%", "better": "down"},
+        {"key": "cost_of_risk", "label": "Cost of risk", "unit": "bp", "better": "down"},
         {"key": "rote", "label": "Return on tangible equity", "unit": "%", "better": "up"},
-        {"key": "cost_income", "label": "Cost / Income", "unit": "%", "better": "down"},
     ],
     "ins": [
         {"key": "solvency2", "label": "Solvency II ratio", "unit": "%", "better": "up", "band": 100},
+        {"key": "liquidity", "label": "Liquid assets", "unit": "€m", "better": "up"},
         {"key": "combined", "label": "Combined ratio", "unit": "%", "better": "down", "band": 100},
-        {"key": "roe", "label": "Return on equity", "unit": "%", "better": "up"},
-        {"key": "fin_leverage", "label": "Financial leverage", "unit": "%", "better": "down"},
         {"key": "interest_cover", "label": "Interest coverage", "unit": "x", "better": "up", "band": 1},
+        {"key": "fin_leverage", "label": "Financial leverage", "unit": "%", "better": "down"},
+        {"key": "roe", "label": "Return on equity", "unit": "%", "better": "up"},
     ],
     "sov": [
+        {"key": "reserves", "label": "FX reserves", "unit": "months", "better": "up"},
+        {"key": "gfn", "label": "Gross financing need", "unit": "% GDP", "better": "down"},
+        {"key": "interest_rev", "label": "Interest / Revenue", "unit": "%", "better": "down"},
         {"key": "debt_gdp", "label": "Debt / GDP", "unit": "%", "better": "down"},
         {"key": "fiscal_balance", "label": "Fiscal balance", "unit": "% GDP", "better": "up", "band": 0},
-        {"key": "interest_rev", "label": "Interest / Revenue", "unit": "%", "better": "down"},
-        {"key": "gfn", "label": "Gross financing need", "unit": "% GDP", "better": "down"},
         {"key": "growth", "label": "Real GDP growth", "unit": "%", "better": "up", "band": 0},
-        {"key": "reserves", "label": "FX reserves", "unit": "months", "better": "up"},
     ],
 }
 
 
 def _metrics_schema(mode):
-    mp = {}
-    for m in CREDIT_METRICS[mode]:
-        mp[m["key"]] = {"type": "object", "required": ["hist", "fcst"], "properties": {
-            "hist": {"type": "array", "items": {"type": ["number", "null"]},
-                     "description": f"{m['label']} ({m['unit']}) - last 5 fiscal years, oldest to newest, actuals."},
-            "fcst": {"type": "array", "items": {"type": ["number", "null"]},
-                     "description": f"{m['label']} ({m['unit']}) - next 5 years, base-case forecast."},
-            "note": {"type": "string", "description": "one short clause"}}}
-    return {"type": "object", "required": ["rating", "trend", "headline", "metrics"], "properties": {
-        "company": {"type": "string"},
+    props = {
         "rating": {"type": "string", "description": "agency-style with outlook, e.g. 'BBB / stable'"},
         "trend": {"type": "string", "enum": ["improving", "stable", "deteriorating"]},
-        "headline": {"type": "string", "description": "one sentence - the credit in a nutshell"},
-        "biggest_risk": {"type": "string", "description": "one line"},
-        "metrics": {"type": "object", "required": [m["key"] for m in CREDIT_METRICS[mode]], "properties": mp},
-        "sources": {"type": "array", "items": {"type": "string"}}}}
+        "takeaway1": {"type": "string", "description": "key takeaway on liquidity/cash, <= 12 words"},
+        "takeaway2": {"type": "string", "description": "key takeaway on interest burden or coverage, <= 12 words"},
+        "takeaway3": {"type": "string", "description": "key takeaway on leverage or the main stress point, <= 12 words"},
+        "sources": {"type": "array", "items": {"type": "string"},
+                    "description": "3-6 source URLs (links) actually used, e.g. https://..."},
+    }
+    req = ["rating", "trend", "takeaway1", "takeaway2", "takeaway3"]
+    for m in CREDIT_METRICS[mode]:
+        props[m["key"] + "_series"] = {"type": "array", "items": {"type": "number"},
+            "description": f"{m['label']} ({m['unit']}): EXACTLY 10 numbers, chronological - the 5 most "
+                           f"recent fiscal years (actuals) followed by the next 5 years (base-case forecast)."}
+        req.append(m["key"] + "_series")
+    return {"type": "object", "required": req, "properties": props}
+
+
+def _populated(out, mode):
+    return sum(1 for m in CREDIT_METRICS[mode] if len(_num_arr((out or {}).get(m["key"] + "_series"))) >= 6)
 
 
 CREDIT_MODEL = "claude-sonnet-5"
@@ -1784,67 +1886,531 @@ def _extract_tool(msg, name):
     return None
 
 
+def _parse_json_obj(text):
+    if not text:
+        return None
+    t = text.strip()
+    if "```" in t:
+        t = re.sub(r"```[a-zA-Z]*", "", t).replace("```", "")
+    a, b = t.find("{"), t.rfind("}")
+    if a < 0 or b <= a:
+        return None
+    try:
+        return json.loads(t[a:b + 1])
+    except Exception:
+        return None
+
+
 def _credit_metrics_job(issuer, mode):
     labels = ", ".join(f"{m['label']} ({m['unit']})" for m in CREDIT_METRICS[mode])
-    tool = {"name": "report_credit",
-            "description": "Report the issuer's key credit metrics with 5y history and 5y base-case forecast.",
-            "input_schema": _metrics_schema(mode)}
-    prompt = (
-        f"You are a senior Oaktree credit analyst. For '{issuer}' (type: {mode}), assess these key credit "
-        f"metrics: {labels}. For each, give 5 fiscal years of actual history (oldest to newest) and a 5-year "
-        f"base-case forecast, grounded in the latest reported financials and guidance. Also give a one-sentence "
-        f"headline, an agency-style rating with outlook, the credit trend, and the single biggest risk. Give "
-        f"best estimates where data is not disclosed; use null only if truly unknowable.")
+    keys = [m["key"] for m in CREDIT_METRICS[mode]]
     cl = _anthropic()
-    # Pass 1: let it research the web, then report.
+    research = ""
     try:
-        msg = cl.messages.create(model=CREDIT_MODEL, max_tokens=8000,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}, tool],
-            messages=[{"role": "user", "content": prompt + " Search the web for current figures, then call report_credit."}])
-        out = _extract_tool(msg, "report_credit")
-        if out:
-            return out
+        r = cl.messages.create(model=CREDIT_MODEL, max_tokens=3500,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+            messages=[{"role": "user", "content":
+                f"Research the credit and liquidity profile of '{issuer}' (type: {mode}). Find the last 5 "
+                f"fiscal years of actuals and consensus/guidance for the next 5 years for: {labels}. Focus on "
+                f"cash and liquidity, interest burden, refinancing/maturities, coverage and leverage, plus the "
+                f"agency ratings and outlook. Return concise bullet notes with concrete numbers per year."}])
+        research = "".join(b.text for b in r.content if getattr(b, "type", None) == "text")
     except Exception:
-        pass
-    # Pass 2: force the structured tool from the model's own knowledge (guaranteed output).
+        research = ""
+    fields = ("rating (string, agency-style rating with outlook), trend (one of: improving, stable, "
+              "deteriorating), takeaway1, takeaway2, takeaway3 (short strings on cash, interest cost and "
+              "leverage/stress), sources (array of source URL strings), and:\n"
+              + "".join(f'  "{k}_series": array of EXACTLY 10 numbers (5 past fiscal years then 5 forecast '
+                        f'years, chronological)\n' for k in keys))
+    prompt = (
+        f"You are a senior Oaktree credit analyst modelling credit metrics for '{issuer}' (type: {mode}). "
+        f"Metrics: {labels}.\nReturn ONLY one JSON object (no prose, no markdown fences) with these keys:\n"
+        f"{fields}\nEvery *_series MUST contain exactly 10 real numbers — never empty; estimate if a figure "
+        f"is not disclosed."
+        + (f"\n\nResearch notes:\n{research}" if research.strip() else ""))
+    best = None
+    for _ in range(3):
+        msg = cl.messages.create(model=CREDIT_MODEL, max_tokens=4000,
+            messages=[{"role": "user", "content": prompt}])
+        text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
+        out = _parse_json_obj(text)
+        if out and (best is None or _populated(out, mode) > _populated(best, mode)):
+            best = out
+        if best and _populated(best, mode) >= len(CREDIT_METRICS[mode]):
+            break
+    if best and _populated(best, mode) >= 1:
+        return best
+    tool = {"name": "report_credit", "description": "Report the issuer's credit metrics.",
+            "input_schema": _metrics_schema(mode)}
     msg = cl.messages.create(model=CREDIT_MODEL, max_tokens=8000, tools=[tool],
         tool_choice={"type": "tool", "name": "report_credit"},
-        messages=[{"role": "user", "content": prompt + " Use your own knowledge; call report_credit now."}])
+        messages=[{"role": "user", "content": prompt}])
     out = _extract_tool(msg, "report_credit")
     if out:
         return out
     raise RuntimeError("model returned no structured result")
 
 
+BBG_HOST, BBG_PORT = "localhost", 8194
+BBG_FCAST = {
+    "ebitda": lambda b, p: b.get(("BEST_EBITDA", p)),
+    "leverage": lambda b, p: (b.get(("BEST_NET_DEBT", p)) / b["BEST_EBITDA", p]) if b.get(("BEST_EBITDA", p)) else None,
+}
+
+
+def _bbg_session():
+    import blpapi
+    o = blpapi.SessionOptions(); o.setServerHost(BBG_HOST); o.setServerPort(BBG_PORT)
+    s = blpapi.Session(o)
+    if not s.start() or not s.openService("//blp/refdata"):
+        raise RuntimeError("Bloomberg not reachable — is the Terminal running and logged in?")
+    return s
+
+
+def _bbg_drain(sess):
+    import blpapi
+    msgs = []
+    while True:
+        ev = sess.nextEvent(15000)
+        for m in ev:
+            msgs.append(m)
+        if ev.eventType() == blpapi.Event.RESPONSE:
+            return msgs
+
+
+def _bbg_hist(sess, ticker, fields, yrs=6):
+    svc = sess.getService("//blp/refdata")
+    r = svc.createRequest("HistoricalDataRequest")
+    r.append("securities", ticker)
+    for f in fields:
+        r.append("fields", f)
+    r.set("periodicitySelection", "YEARLY")
+    y = pd.Timestamp.today().year
+    r.set("startDate", f"{y - yrs}0101"); r.set("endDate", f"{y}1231")
+    sess.sendRequest(r)
+    out = {f: {} for f in fields}
+    for msg in _bbg_drain(sess):
+        if not msg.hasElement("securityData"):
+            continue
+        fd = msg.getElement("securityData").getElement("fieldData")
+        for i in range(fd.numValues()):
+            p = fd.getValue(i)
+            yr = int(p.getElementAsString("date")[:4])
+            for f in fields:
+                if p.hasElement(f):
+                    out[f][yr] = p.getElementAsFloat(f)
+    return out
+
+
+_BBG_NAME_CACHE = {}
+
+
+def _bbg_name(ticker):
+    ticker = (ticker or "").strip()
+    if not ticker:
+        return ""
+    if ticker in _BBG_NAME_CACHE:
+        return _BBG_NAME_CACHE[ticker]
+    name = re.sub(r"\s+(Equity|Corp|Comdty|Index|Govt|Curncy)$", "", ticker, flags=re.I).strip() or ticker
+    try:
+        sess = _bbg_session()
+        try:
+            ref, _ = _bbg_ref(sess, ticker, ["NAME"])
+            name = ref.get("NAME") or name
+        finally:
+            sess.stop()
+    except Exception:
+        pass
+    _BBG_NAME_CACHE[ticker] = name
+    return name
+
+
+def _bbg_ref(sess, ticker, fields, periods=None):
+    svc = sess.getService("//blp/refdata")
+    ref, best = {}, {}
+    r = svc.createRequest("ReferenceDataRequest")
+    r.append("securities", ticker)
+    for f in fields:
+        r.append("fields", f)
+    sess.sendRequest(r)
+    for msg in _bbg_drain(sess):
+        if msg.hasElement("securityData"):
+            fd = msg.getElement("securityData").getValue(0).getElement("fieldData")
+            for f in fields:
+                if fd.hasElement(f):
+                    ref[f] = fd.getElementAsString(f)
+    for per in (periods or []):
+        r = svc.createRequest("ReferenceDataRequest")
+        r.append("securities", ticker)
+        r.append("fields", "BEST_EBITDA"); r.append("fields", "BEST_NET_DEBT")
+        ov = r.getElement("overrides").appendElement()
+        ov.setElement("fieldId", "BEST_FPERIOD_OVERRIDE"); ov.setElement("value", per)
+        sess.sendRequest(r)
+        for msg in _bbg_drain(sess):
+            if msg.hasElement("securityData"):
+                fd = msg.getElement("securityData").getValue(0).getElement("fieldData")
+                for f in ("BEST_EBITDA", "BEST_NET_DEBT"):
+                    if fd.hasElement(f):
+                        best[(f, per)] = fd.getElementAsFloat(f)
+    return ref, best
+
+
+def _yk_to_ticker(sec):
+    mo = re.match(r"(.*)<(\w+)>", sec or "")
+    return f"{mo.group(1)} {mo.group(2).capitalize()}" if mo else sec
+
+
+def _bbg_search(sess, query, yk="YK_FILTER_NONE", n=8):
+    sess.openService("//blp/instruments")
+    isvc = sess.getService("//blp/instruments")
+    r = isvc.createRequest("instrumentListRequest")
+    r.set("query", query); r.set("yellowKeyFilter", yk); r.set("maxResults", n)
+    sess.sendRequest(r)
+    out = []
+    for msg in _bbg_drain(sess):
+        if msg.hasElement("results"):
+            for it in msg.getElement("results").values():
+                sec = it.getElementAsString("security")
+                desc = it.getElementAsString("description") if it.hasElement("description") else ""
+                out.append((_yk_to_ticker(sec), desc))
+    return out
+
+
+def _resolve_equity(sess, query):
+    q = (query or "").strip()
+    low = q.lower()
+    if low.endswith(" equity"):
+        return q
+    if low.endswith(" corp"):
+        ref, _ = _bbg_ref(sess, q, ["NAME"])
+        q = ref.get("NAME") or q
+    hits = _bbg_search(sess, q, "YK_FILTER_EQTY", 1)
+    return hits[0][0] if hits else q
+
+
+def _bbg_maturity_wall(sess, query, equity):
+    q = (query or "").strip()
+    key = q.split()[0] if q.lower().endswith(" corp") else \
+        (_bbg_ref(sess, equity, ["SHORT_NAME"])[0].get("SHORT_NAME") or query).split()[0]
+    hits = _bbg_search(sess, key, "YK_FILTER_CORP", 40)
+    secs = [t for t, d in hits if "CDS" not in t and "Loan" not in d and "Multiple" not in d
+            and not re.match(r"^B[LF]\d", t)]
+    if not secs:
+        return {}
+    svc = sess.getService("//blp/refdata")
+    r = svc.createRequest("ReferenceDataRequest")
+    for sc in secs[:40]:
+        r.append("securities", sc)
+    for f in ("MATURITY", "AMT_OUTSTANDING"):
+        r.append("fields", f)
+    sess.sendRequest(r)
+    wall = {}
+    for msg in _bbg_drain(sess):
+        if msg.hasElement("securityData"):
+            for sd in msg.getElement("securityData").values():
+                if not sd.hasElement("fieldData"):
+                    continue
+                fd = sd.getElement("fieldData")
+                if fd.hasElement("MATURITY") and fd.hasElement("AMT_OUTSTANDING"):
+                    amt = fd.getElementAsFloat("AMT_OUTSTANDING")
+                    yr = int(fd.getElementAsString("MATURITY")[:4])
+                    if amt > 0:
+                        wall[yr] = wall.get(yr, 0.0) + amt / 1e6
+    return wall
+
+
+def _bbg_peers(sess, ticker, n=3):
+    svc = sess.getService("//blp/refdata")
+    r = svc.createRequest("ReferenceDataRequest")
+    r.append("securities", ticker); r.append("fields", "BLOOMBERG_PEERS")
+    sess.sendRequest(r)
+    peers = []
+    for msg in _bbg_drain(sess):
+        if msg.hasElement("securityData"):
+            fd = msg.getElement("securityData").getValue(0).getElement("fieldData")
+            if fd.hasElement("BLOOMBERG_PEERS"):
+                arr = fd.getElement("BLOOMBERG_PEERS")
+                for i in range(min(n, arr.numValues())):
+                    try:
+                        peers.append(arr.getValue(i).getElement(0).getValueAsString())
+                    except Exception:
+                        pass
+    return [p if p.endswith("Equity") else p + " Equity" for p in peers]
+
+
+def _bbg_peer_medians(sess, peers, fields):
+    if not peers:
+        return {}
+    svc = sess.getService("//blp/refdata")
+    r = svc.createRequest("ReferenceDataRequest")
+    for p in peers:
+        r.append("securities", p)
+    for f in fields:
+        r.append("fields", f)
+    sess.sendRequest(r)
+    vals = {f: [] for f in fields}
+    for msg in _bbg_drain(sess):
+        if msg.hasElement("securityData"):
+            for sd in msg.getElement("securityData").values():
+                if sd.hasElement("fieldData"):
+                    fd = sd.getElement("fieldData")
+                    for f in fields:
+                        if fd.hasElement(f):
+                            try:
+                                vals[f].append(fd.getElementAsFloat(f))
+                            except Exception:
+                                pass
+    import statistics
+    return {f: (round(statistics.median(v), 2) if v else None) for f, v in vals.items()}
+
+
+_OUTLOOK_MAP = {"POS": "positive", "STA": "stable", "NEG": "negative", "DEV": "developing"}
+_COV_CACHE = {}
+
+
+def _bbg_covenants(name, mode, cur_lev, cur_cov):
+    if mode != "corp":
+        return []
+    if name in _COV_CACHE:
+        return _COV_CACHE[name]
+    prompt = (f"You are a senior Oaktree credit analyst. For {name}, list the 2-3 main financial maintenance "
+              f"covenants in its bonds/credit facilities with their threshold levels (leverage cap, interest "
+              f"coverage floor, etc.). Current Net Debt/EBITDA is {cur_lev}, EBITDA/Interest is {cur_cov}. "
+              f"Return ONLY a JSON object: {{\"covenants\":[{{\"name\":\"..\",\"threshold\":\"..\",\"headroom\":\"..\"}}]}}. "
+              f"headroom = short phrase on distance to breach vs the current figure. If the issuer is "
+              f"investment-grade with no maintenance covenants, return an empty covenants list.")
+    try:
+        msg = _anthropic().messages.create(model=CREDIT_MODEL, max_tokens=700,
+            messages=[{"role": "user", "content": prompt}])
+        j = _parse_json_obj("".join(b.text for b in msg.content if getattr(b, "type", None) == "text")) or {}
+        cov = j.get("covenants") or []
+    except Exception:
+        cov = []
+    _COV_CACHE[name] = cov
+    return cov
+
+
+def _bbg_narrative(name, mode, series_lines):
+    prompt = (f"You are a senior Oaktree credit analyst. These are Bloomberg figures for {name} "
+              f"(5y actuals + estimates):\n{series_lines}\nReturn ONLY a JSON object with keys trend "
+              f"(improving|stable|deteriorating) and takeaway1, takeaway2, takeaway3 (each <=12 words on cash, "
+              f"interest cost, leverage/stress).")
+    try:
+        msg = _anthropic().messages.create(model=CREDIT_MODEL, max_tokens=600,
+            messages=[{"role": "user", "content": prompt}])
+        j = _parse_json_obj("".join(b.text for b in msg.content if getattr(b, "type", None) == "text")) or {}
+    except Exception:
+        j = {}
+    return j
+
+
+_BOND_FIELDS = ["SECURITY_DES", "CPN", "MATURITY", "PAYMENT_RANK", "AMT_OUTSTANDING", "CRNCY",
+                "ID_ISIN", "CALLABLE", "YLD_YTM_MID", "Z_SPRD_MID"]
+
+
+def _bbg_bonds(query):
+    sess = _bbg_session()
+    try:
+        q = (query or "").strip()
+        if q.lower().endswith(" corp"):
+            key = q.split()[0]
+        else:
+            key = (_bbg_ref(sess, _resolve_equity(sess, q), ["SHORT_NAME"])[0].get("SHORT_NAME") or q).split()[0]
+        hits = _bbg_search(sess, key, "YK_FILTER_CORP", 40)
+        secs = [t for t, d in hits if "CDS" not in t and "Loan" not in d and "Multiple" not in d
+                and not re.match(r"^B[LF]\d", t)]
+        if not secs:
+            return []
+        svc = sess.getService("//blp/refdata")
+        r = svc.createRequest("ReferenceDataRequest")
+        for sc in secs[:30]:
+            r.append("securities", sc)
+        for f in _BOND_FIELDS:
+            r.append("fields", f)
+        sess.sendRequest(r)
+        bonds = []
+        for msg in _bbg_drain(sess):
+            if msg.hasElement("securityData"):
+                for sd in msg.getElement("securityData").values():
+                    if not sd.hasElement("fieldData"):
+                        continue
+                    fd = sd.getElement("fieldData")
+                    def g(f):
+                        return fd.getElementAsString(f) if fd.hasElement(f) else ""
+                    def gf(f):
+                        try:
+                            return fd.getElementAsFloat(f) if fd.hasElement(f) else None
+                        except Exception:
+                            return None
+                    if not g("MATURITY"):
+                        continue
+                    amt = gf("AMT_OUTSTANDING")
+                    bonds.append({
+                        "desc": g("SECURITY_DES"), "cpn": f"{gf('CPN'):.2f}" if gf("CPN") is not None else "",
+                        "maturity": g("MATURITY"), "rank": g("PAYMENT_RANK"), "ccy": g("CRNCY"),
+                        "amt": f"{amt / 1e6:,.0f}" if amt else "", "ytm": f"{gf('YLD_YTM_MID'):.2f}" if gf("YLD_YTM_MID") is not None else "",
+                        "zsprd": f"{gf('Z_SPRD_MID'):.0f}" if gf("Z_SPRD_MID") is not None else "",
+                        "call": "Y" if g("CALLABLE") == "Y" else "", "isin": g("ID_ISIN")})
+        bonds.sort(key=lambda b: b["maturity"])
+        return bonds
+    finally:
+        sess.stop()
+
+
+def _bond_table(bonds):
+    cols = [("desc", "Bond"), ("cpn", "Cpn"), ("maturity", "Maturity"), ("rank", "Seniority"),
+            ("ccy", "Ccy"), ("amt", "Amt (m)"), ("ytm", "YTM %"), ("zsprd", "Z (bp)"),
+            ("call", "Call"), ("isin", "ISIN")]
+    return ds.data_table(
+        data=[{c: b.get(c, "") for c, _ in cols} for b in bonds],
+        columns=[{"name": n, "id": c} for c, n in cols], page_action="none",
+        export_format="csv", export_headers="display", fixed_rows={"headers": False},
+        style_cell={**ds.TABLE_CELL_STYLE, "fontSize": "12px", "fontFamily": ds.FONT["family"]},
+        style_table={**ds.TABLE_STYLE, "maxHeight": "none"})
+
+
+def _bbg_metrics(query, mode):
+    metrics = CREDIT_METRICS[mode]
+    fields = [m["bbg"] for m in metrics if m.get("bbg")]
+    if not fields:
+        raise RuntimeError("No Bloomberg field mapping for this issuer type yet — use AI mode.")
+    sess = _bbg_session()
+    try:
+        ticker = _resolve_equity(sess, query)
+        hist = _bbg_hist(sess, ticker, fields)
+        ref, best = _bbg_ref(sess, ticker,
+            ["NAME", "RTG_SP_LT_LC_ISSUER_CREDIT", "RTG_MOODY_LONG_TERM", "RTG_SP_OUTLOOK"],
+            periods=["1BF", "2BF", "3BF"])
+        try:
+            pmed = _bbg_peer_medians(sess, _bbg_peers(sess, ticker), fields)
+        except Exception:
+            pmed = {}
+        try:
+            wall = _bbg_maturity_wall(sess, query, ticker)
+        except Exception:
+            wall = {}
+    finally:
+        sess.stop()
+    y = pd.Timestamp.today().year
+    yrs = [y - 5 + i for i in range(6)]
+    out, lines = {}, []
+    for m in metrics:
+        f = m.get("bbg")
+        h = [hist.get(f, {}).get(yr) for yr in yrs] if f else []
+        h = [v for v in h if v is not None][-5:]
+        fc = []
+        if m["key"] in BBG_FCAST:
+            for per in ("1BF", "2BF", "3BF"):
+                v = BBG_FCAST[m["key"]](best, per)
+                if v is not None:
+                    fc.append(round(v, 2))
+        out[m["key"] + "_series"] = [None] * (5 - len(h)) + h + fc
+        out[m["key"] + "_peer"] = pmed.get(f)
+        if h:
+            lines.append(f"{m['label']} ({m['unit']}): {', '.join(f'{v:.1f}' for v in h)}" + (f" | est {fc}" if fc else ""))
+    name = ref.get("NAME", ticker)
+    sp, mo = ref.get("RTG_SP_LT_LC_ISSUER_CREDIT", ""), ref.get("RTG_MOODY_LONG_TERM", "")
+    outlook = _OUTLOOK_MAP.get((ref.get("RTG_SP_OUTLOOK") or "").upper()[:3], "")
+    out["rating"] = " / ".join(x for x in [f"{sp} (S&P)" if sp else "", f"{mo} (Moody's)" if mo else ""] if x) or "NR"
+    out["outlook"] = outlook
+    out["company"] = name
+    nar = _bbg_narrative(name, mode, "\n".join(lines))
+    out["trend"] = nar.get("trend") or {"positive": "improving", "negative": "deteriorating"}.get(outlook, "stable")
+    for i in (1, 2, 3):
+        out[f"takeaway{i}"] = nar.get(f"takeaway{i}", "")
+    lev = next((v for v in reversed(_num_arr(out.get("leverage_series"))) if v is not None), "n/a")
+    cov = next((v for v in reversed(_num_arr(out.get("interest_cover_series"))) if v is not None), "n/a")
+    ig = sp.upper().startswith(("AAA", "AA", "A", "BBB")) or mo.upper().startswith(("AAA", "AA", "A", "BAA"))
+    out["covenants"] = [] if ig else _bbg_covenants(name, mode, lev, cov)
+    out["wall"] = wall
+    out["sources"] = [f"Bloomberg Terminal — {name} ({ticker}); ratings, fundamentals, peers, maturities"]
+    return out
+
+
 def _fmt_metric(v, unit):
     if v is None:
         return "—"
-    return f"{v:.1f}x" if unit == "x" else f"{v:,.1f} {unit}"
+    if unit == "x":
+        return f"{v:.1f}x"
+    if unit in ("€m", "bp"):
+        return f"{v:,.0f} {unit}"
+    return f"{v:,.1f} {unit}"
 
 
-def _metric_fig(m, md, t0):
-    hist = [None if v is None else float(v) for v in (md.get("hist") or [])][-5:]
-    fcst = [None if v is None else float(v) for v in (md.get("fcst") or [])][:5]
-    if not any(v is not None for v in hist) and not any(v is not None for v in fcst):
+def _num_arr(v):
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except Exception:
+            return []
+    if not isinstance(v, (list, tuple)):
+        return []
+    out = []
+    for x in v:
+        try:
+            out.append(None if x is None else float(x))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _source_links(sources):
+    items = []
+    for s in (sources or []):
+        s = str(s).strip()
+        if not s:
+            continue
+        mo = re.search(r"https?://\S+", s)
+        if mo:
+            url = mo.group(0).rstrip(".,);]")
+            label = s.replace(mo.group(0), "").strip(" -—:·|") or url
+            items.append(html.A(label, href=url, target="_blank", style={
+                "color": ds.COLORS["primary"], "fontSize": "12.5px", "textDecoration": "none",
+                "display": "block", "margin": "3px 0", "wordBreak": "break-word"}))
+        else:
+            items.append(html.Div(s, style={"color": ds.COLORS["secondary"], "fontSize": "12.5px", "margin": "3px 0"}))
+    if not items:
+        return html.Span()
+    return html.Div([html.Div("sources", style={**ds.LABEL_STYLE, "marginTop": "16px"}),
+                     html.Div(items, style={"marginTop": "4px"})])
+
+
+def _metric_fig(m, md, t0, peer=None):
+    hist = _num_arr(md.get("hist"))[-5:]
+    fcst = _num_arr(md.get("fcst"))[:5]
+    vals = [v for v in hist + fcst if v is not None]
+    if not vals:
         return None
     yh = [t0 - len(hist) + 1 + i for i in range(len(hist))]
+    good = None
+    hv = [v for v in hist if v is not None]
+    if len(hv) >= 2:
+        good = (hv[-1] > hv[0]) if m["better"] == "up" else (hv[-1] < hv[0])
+    vcol = ds.HEX["positive"] if good else (ds.HEX["negative"] if good is False else ds.HEX["ink"])
     fig = go.Figure()
+    if fcst:
+        fig.add_vrect(x0=t0, x1=t0 + len(fcst), fillcolor="rgba(192,163,100,.05)", line_width=0, layer="below")
     if hist:
-        fig.add_scatter(x=yh, y=hist, mode="lines+markers", line=dict(color=ds.HEX["ink"], width=2),
+        fig.add_scatter(x=yh, y=hist, mode="lines+markers", line=dict(color=ds.HEX["ink"], width=2.6),
                         marker=dict(size=5), hovertemplate="%{x}: %{y:,.1f}<extra></extra>")
     if fcst:
         last = next((v for v in reversed(hist) if v is not None), fcst[0])
         yf = [yh[-1] if yh else t0] + [t0 + 1 + i for i in range(len(fcst))]
         fig.add_scatter(x=yf, y=[last] + fcst, mode="lines+markers",
-                        line=dict(color=ds.HEX["primary"], width=2, dash="dot"), marker=dict(size=5),
+                        line=dict(color=ds.HEX["primary"], width=2.4, dash="dot"), marker=dict(size=4),
                         hovertemplate="%{x}: %{y:,.1f} (f)<extra></extra>")
     if m.get("band") is not None:
         fig.add_hline(y=m["band"], line=dict(color=ds.HEX["negative"], width=1, dash="dash"))
+    if peer is not None:
+        fig.add_hline(y=peer, line=dict(color=ds.HEX["secondary"], width=1.2, dash="dot"),
+                      annotation_text="peer median", annotation_position="top left",
+                      annotation_font=dict(size=9, color=ds.HEX["secondary"]))
+    fig.add_vline(x=t0 + 0.5, line=dict(color=ds.HEX["border"], width=1, dash="dot"))
     latest = next((v for v in reversed(hist) if v is not None), None)
-    ttl = f"{m['label']}   ·   {_fmt_metric(latest, m['unit'])}"
-    fig = ds.style_figure(fig, height=210)
-    fig.update_layout(showlegend=False, hovermode="x unified", margin=dict(t=32, b=22, l=8, r=12),
-        title=dict(text=ttl, x=0, font=dict(family=ds.FONT["family"], size=12.5, color=ds.HEX["text"])))
+    ttl = f"{m['label']}   <span style='color:{vcol}'><b>{_fmt_metric(latest, m['unit'])}</b></span>"
+    fig = ds.style_figure(fig, height=215)
+    fig.update_layout(showlegend=False, hovermode="x unified", margin=dict(t=34, b=22, l=8, r=12),
+        title=dict(text=ttl, x=0.02, font=dict(family=ds.FONT["family"], size=13, color=ds.HEX["text"])))
     return dcc.Graph(figure=fig, config={"displaylogo": False})
 
 
@@ -1852,72 +2418,84 @@ def build_credit_model(mode, data, issuer=""):
     trend = str(data.get("trend", "stable")).lower()
     color = {"improving": ds.HEX["positive"], "deteriorating": ds.HEX["negative"]}.get(trend, ds.HEX["highlight"])
     t0 = pd.Timestamp.today().year
-    verdict = ds.panel([
+    takeaways = [str(data.get(k, "")).strip() for k in ("takeaway1", "takeaway2", "takeaway3")]
+    takeaways = [t for t in takeaways if t and not t.startswith("<")]
+    header = ds.panel([
         html.Div([
-            html.Span(style={"width": "12px", "height": "12px", "borderRadius": "50%", "background": color,
-                             "display": "inline-block", "marginRight": "10px", "boxShadow": f"0 0 10px {color}"}),
-            html.Span(data.get("rating", "—"), style={"fontFamily": ds.FONT["serif"], "fontSize": "20px",
-                                                      "fontWeight": 600, "color": color}),
-            html.Span(f"  ·  {issuer or data.get('company', '')} · {mode.upper()} · {trend}",
-                      style={"fontFamily": ds.FONT["family"], "fontSize": "13px", "color": ds.COLORS["muted"]}),
+            html.Span(str(data.get("rating", "—")), style={
+                "fontFamily": ds.FONT["serif"], "fontSize": "17px", "fontWeight": 600, "color": color,
+                "background": f"{color}22", "border": f"1px solid {color}55", "padding": "4px 14px",
+                "borderRadius": "999px"}),
+            html.Span(f"{issuer or data.get('company', '')}  ·  {mode.upper()}  ·  {trend}"
+                      + (f"  ·  {data['outlook']} outlook" if data.get("outlook") else ""),
+                      style={"fontFamily": ds.FONT["family"], "fontSize": "12.5px",
+                             "color": ds.COLORS["muted"], "marginLeft": "14px"}),
         ], style={"display": "flex", "alignItems": "center", "flexWrap": "wrap"}),
-        html.Div(data.get("headline", ""), style={"fontFamily": ds.FONT["serif"], "fontSize": "16px",
-                                                  "color": ds.COLORS["ink"], "marginTop": "10px"}),
-        html.Div("Key risk — " + data["biggest_risk"], style={"fontFamily": ds.FONT["family"], "fontSize": "13.5px",
-                 "color": ds.COLORS["text"], "marginTop": "8px", "fontWeight": 600}) if data.get("biggest_risk") else html.Span(),
+        html.Ul([html.Li(t, style={"marginBottom": "3px"}) for t in takeaways],
+                style={"margin": "12px 0 0", "paddingLeft": "18px", "fontFamily": ds.FONT["family"],
+                       "fontSize": "13.5px", "color": ds.COLORS["ink"], "lineHeight": 1.55}) if takeaways else html.Span(),
     ])
-    md = data.get("metrics") or {}
     cards = []
     for m in CREDIT_METRICS.get(mode, CREDIT_METRICS["corp"]):
-        g = _metric_fig(m, md.get(m["key"]) or {}, t0)
-        if g:
-            cards.append(html.Div(g, style={"flex": "1 1 300px", "minWidth": "280px"}))
-    body = [verdict, html.Div(cards, style={"display": "flex", "flexWrap": "wrap", "gap": "8px", "marginTop": "6px"})]
-    src = data.get("sources") or []
-    if src:
-        body.append(html.Details([
-            html.Summary("sources", style={"cursor": "pointer", "color": ds.COLORS["primary"],
-                "fontFamily": ds.FONT["family"], "fontSize": "12px", "margin": "10px 2px 4px"}),
-            html.Div(" · ".join(str(s) for s in src), style={**ds.LABEL_STYLE, "textTransform": "none",
-                     "letterSpacing": 0, "fontSize": "11.5px", "lineHeight": 1.5})]))
+        ser = _num_arr(data.get(m["key"] + "_series"))
+        g = _metric_fig(m, {"hist": ser[:5], "fcst": ser[5:10]}, t0, peer=data.get(m["key"] + "_peer"))
+        if g is not None:
+            cards.append(html.Div(g, className="stat-card", style={"flex": "1 1 320px", "minWidth": "300px",
+                         "padding": "6px 8px 2px", "borderRadius": ds.RADIUS["lg"]}))
+    body = [header, html.Div(cards, style={"display": "flex", "flexWrap": "wrap", "gap": "10px", "marginTop": "8px"})]
+    if not cards:
+        body.append(_cm_error("No metric data returned — try again."))
+    wall = {int(k): float(v) for k, v in (data.get("wall") or {}).items() if v}
+    wyrs = [y for y in sorted(wall) if y >= t0][:12]
+    if wyrs:
+        wf = go.Figure(go.Bar(x=wyrs, y=[wall[y] for y in wyrs], marker_color=ds.HEX["primary"],
+            text=[f"{wall[y]:,.0f}" for y in wyrs], textposition="outside",
+            hovertemplate="%{x}: %{y:,.0f} m maturing<extra></extra>"))
+        wf = ds.style_figure(wf, height=260)
+        wf.update_layout(margin=dict(t=32, b=24, l=8, r=12), hovermode="x",
+            title=dict(text="Maturity wall — debt maturing (m, face)", x=0.02,
+                       font=dict(family=ds.FONT["family"], size=13, color=ds.HEX["text"])))
+        body.append(html.Div(dcc.Graph(figure=wf, config={"displaylogo": False}), className="stat-card",
+                    style={"marginTop": "10px", "padding": "6px 8px 2px", "borderRadius": ds.RADIUS["lg"]}))
+    cov = data.get("covenants") or []
+    if cov:
+        items = []
+        for c in cov:
+            nm, th, hd = str(c.get("name", "")), str(c.get("threshold", "")), str(c.get("headroom", ""))
+            items.append(html.Li([html.B(nm), (f" — {th}" if th else ""),
+                                  (html.Span(f"  ·  {hd}", style={"color": ds.COLORS["muted"]}) if hd else "")],
+                                 style={"marginBottom": "4px"}))
+        body.append(html.Div([
+            html.Div("covenants · distance to breach", style={**ds.LABEL_STYLE, "marginTop": "16px"}),
+            html.Ul(items, style={"margin": "6px 0 0", "paddingLeft": "18px", "fontFamily": ds.FONT["family"],
+                                  "fontSize": "13px", "color": ds.COLORS["ink"], "lineHeight": 1.5})]))
+    body.append(_source_links(data.get("sources")))
     return html.Div(body)
 
 
 def tab_iss_liquidity():
     return html.Div([
-        ds.panel([
-            _issuer_controls("liqm-mode", "liqm-input", "liqm-run", "Build model", "liqm-status",
-                             "Issuer…", title="Liquidity & Stress Model")],
-            pad="30px 30px 26px"),
+        _run_button("Build model", "liqm-run", "liqm-status"),
         dcc.Loading(type="dot", color=ds.COLORS["primary"], children=html.Div(id="liqm-output")),
-        dcc.Store(id="liqm-store", storage_type="session"),
+        _busy(dcc.Store(id="liqm-store", storage_type="session")),
         xagent_box("xam", "Ask about liquidity, covenants, stress or relative value…"),
     ], style={"paddingTop": "4px"})
 
 
 def tab_iss_prospectus():
     return html.Div([
-        ds.panel([
-            html.Div([
-                html.Div("Prospectus & Recovery", style=ISS_TITLE),
-                html.Div([
-                    dcc.Input(id="prosp-issuer", type="text", debounce=False, style=ISS_INPUT_BIG,
-                              placeholder="Issuer / instrument (the AI searches for the prospectus)…"),
-                    html.Button("Search prospectus", id="prosp-search", n_clicks=0, style=ISS_BTN_BIG),
-                ], style=ISS_CONTROLS_ROW),
-                html.Div(_status("prosp-status"),
-                         style={"textAlign": "center", "marginTop": "12px", "minHeight": "18px"}),
-                dcc.Upload(id="prosp-upload", multiple=True, style=ISS_DROP,
-                           children="… or drag a prospectus PDF here / click"),
-                html.Div(id="prosp-files"),
-                html.Div(html.Button("Analyze attached PDF", id="prosp-run-file", n_clicks=0,
-                                     style={**ds.BUTTON_STYLE, "background": ds.COLORS["secondary"]}),
-                         style={"textAlign": "center", "marginTop": "10px"}),
-                html.Div(id="prosp-confirm", style={"marginTop": "10px"}),
-            ], style={"maxWidth": "820px", "margin": "0 auto", "width": "100%", "paddingBottom": "26px"})],
-            pad="30px 30px 26px"),
+        _run_button("Search prospectus", "prosp-search", "prosp-status"),
+        ds.container([ds.panel([
+            dcc.Upload(id="prosp-upload", multiple=True, style=ISS_DROP,
+                       children="… or drag a prospectus PDF here / click to analyse a specific document"),
+            html.Div(id="prosp-files"),
+            html.Div(html.Button("Analyze attached PDF", id="prosp-run-file", n_clicks=0,
+                                 style={**ds.BUTTON_STYLE, "background": ds.COLORS["secondary"]}),
+                     style={"textAlign": "center", "marginTop": "10px"}),
+            html.Div(id="prosp-confirm", style={"marginTop": "10px"}),
+        ])], max_width=900),
         dcc.Loading(type="dot", color=ds.COLORS["primary"], children=html.Div(id="prosp-output")),
-        dcc.Store(id="prosp-store", storage_type="session"), dcc.Store(id="prosp-cand"),
+        _busy(dcc.Store(id="prosp-store", storage_type="session")), dcc.Store(id="prosp-cand"),
         dcc.Store(id="prosp-files-data", data=[]),
         xagent_box("xap", "Ask about the prospectus, covenants, recovery or relative value…"),
     ], style={"paddingTop": "4px"})
@@ -1934,8 +2512,25 @@ def issuer_analysis():
             "Issuer analysis needs the internal research engine (research_db), which is not "
             "available on this machine. Set NAD_ENGINE / NAD_ENGINE_DIR to enable it — the rest "
             "of the dashboard works normally."))])
-    return _subtabs("credit", ISSUER_SUBTABS,
-                    [dcc.Download(id="cred-pdf-dl"), dcc.Download(id="liqm-pdf-dl"), dcc.Download(id="prosp-pdf-dl")])
+    return html.Div([
+        dcc.Download(id="cred-pdf-dl"), dcc.Download(id="liqm-pdf-dl"), dcc.Download(id="prosp-pdf-dl"),
+        ds.container([ds.panel([
+            html.Div("Issuer", style=ISS_TITLE),
+            html.Div([
+                _iss_dropdown("iss-mode"),
+                dcc.Dropdown(id="iss-src", className="iss-dd", clearable=False, value="Bloomberg",
+                             persistence=True, persistence_type="session",
+                             options=[{"label": o, "value": o} for o in ("Bloomberg", "AI (web+LLM)")],
+                             style={"flex": "0 0 165px", "fontFamily": ds.FONT["family"], "fontSize": "15px"}),
+                dcc.Input(id="iss-ticker", type="text", debounce=True,
+                          persistence=True, persistence_type="session", style=ISS_INPUT_BIG,
+                          placeholder="Ticker or name — e.g. NESN SW Equity, nestle, or a bond ticker"),
+            ], style=ISS_CONTROLS_ROW),
+            html.Div(id="iss-name", style={**ds.LABEL_STYLE, "textTransform": "none", "letterSpacing": 0,
+                     "textAlign": "center", "marginTop": "10px", "minHeight": "16px", "color": ds.COLORS["primary"]}),
+        ], pad="26px 30px 22px")], max_width=1100),
+        _subtabs("credit", ISSUER_SUBTABS),
+    ])
 
 
 BVI_TEMPLATE = Path(os.environ.get("NAD_BVI_TEMPLATE") or (HERE / "bviSheetOutline.xls"))
@@ -2400,16 +2995,16 @@ def tab_ksa():
                           placeholder="e.g. how does the KSA change if I buy a 2 MM BB corporate bond?"),
                 html.Button("Ask", id="ksa-send", n_clicks=0, style=ISS_BTN_BIG),
             ], style=ISS_CONTROLS_ROW),
-            dcc.Store(id="ksa-hist", data=[], storage_type="session"),
+            _busy(dcc.Store(id="ksa-hist", data=[], storage_type="session")),
         ]),
     ], max_width=1400)
 
 
-ADMIN_SUBTABS = [("KSA", "ksa", tab_ksa), ("BVI", "bvi", tab_bvi)]
+ADMIN_SUBTABS = [("Overview", "overview", tab_overview), ("KSA", "ksa", tab_ksa), ("BVI", "bvi", tab_bvi)]
 
 
 def admin_analysis():
-    return _subtabs("ksa", ADMIN_SUBTABS)
+    return _subtabs("overview", ADMIN_SUBTABS)
 
 
 TOP_TABS = [("Admin", "admin", admin_analysis),
@@ -2417,20 +3012,41 @@ TOP_TABS = [("Admin", "admin", admin_analysis),
             ("Issuer", "iss", issuer_analysis)]
 
 app = Dash(__name__, title="nordIX", suppress_callback_exceptions=True)
+
+
+@app.server.route("/health")
+def _health():
+    return {"status": "ok", "portfolio_ok": bool(PORTFOLIO_OK), "bloomberg": _bbg_up()}, 200
+
+
+def _bbg_up():
+    import socket
+    s = socket.socket()
+    s.settimeout(0.4)
+    try:
+        return s.connect_ex((BBG_HOST, BBG_PORT)) == 0
+    finally:
+        s.close()
+
+
+@app.server.errorhandler(500)
+def _err500(e):
+    log.exception("server 500: %s", getattr(e, "original_exception", e))
+    return {"error": "internal error"}, 500
+
+
+log.info("app initialised · portfolio_ok=%s", bool(PORTFOLIO_OK))
+
+
 _POLISH_CSS = """
 <style>
   html{scroll-behavior:smooth}
-  #busy{position:fixed;inset:0;z-index:9999;display:none;flex-direction:column;align-items:center;
-    justify-content:center;gap:14px;background:rgba(10,8,28,.62);backdrop-filter:blur(2px);cursor:pointer}
-  #busy.busy-on{display:flex}
-  .busy-ring{width:56px;height:56px;border-radius:50%;border:4px solid rgba(192,163,100,.22);
-    border-top-color:#C0A364;animation:busyspin .8s linear infinite;
-    box-shadow:0 0 22px rgba(192,163,100,.35)}
-  @keyframes busyspin{to{transform:rotate(360deg)}}
-  .busy-txt{font-family:'Georgia Pro',Georgia,serif;font-size:15px;letter-spacing:.4px;color:#D4CEC0;text-transform:lowercase}
-  .busy-pct{font-family:'Georgia Pro',Georgia,serif;font-size:30px;font-weight:600;color:#E7E1D3;
-    font-variant-numeric:tabular-nums;min-width:74px;text-align:center}
-  .busy-hint{font-family:'Helvetica Neue',Arial,sans-serif;font-size:11px;color:#9691A9;opacity:.7}
+  /* Fullscreen loading spinner (dcc.Loading) — dark backdrop, gold spinner */
+  .dash-spinner-container,._dash-loading{position:fixed!important;inset:0!important;z-index:9999!important;
+    display:flex!important;align-items:center!important;justify-content:center!important;
+    background:rgba(10,8,28,.66)!important;backdrop-filter:blur(2px)}
+  .dash-spinner-container svg,._dash-loading svg,.dash-spinner{width:64px!important;height:64px!important;
+    color:#C0A364!important;filter:drop-shadow(0 0 16px rgba(192,163,100,.45))}
   .stat-card{-webkit-font-smoothing:antialiased}
   .stat-card:hover{box-shadow:inset 0 1px 0 rgba(255,255,255,.07),0 10px 26px rgba(0,0,0,.42);
     transform:translateY(-1px);border-color:rgba(192,163,100,.4)}
@@ -2532,7 +3148,7 @@ app.layout = ds.page([
     html.Div([
         html.Div([
             brand_logo(40),
-            dcc.Tabs(id="top-tabs", value="pf", colors=TAB_COLORS,
+            dcc.Tabs(id="top-tabs", value="admin", colors=TAB_COLORS,
                      persistence=True, persistence_type="session",
                      style={"display": "flex", "flexWrap": "wrap", "gap": "12px", "border": "none"},
                      children=[dcc.Tab(label=lbl, value=val, style=TOPTAB_STYLE,
@@ -2547,42 +3163,7 @@ app.layout = ds.page([
     ], className="cm-header"),
     html.Div([html.Div(build(), id=f"sec-{val}") for _, val, build in TOP_TABS],
              style={"paddingTop": "6px"}),
-    html.Div([
-        html.Div(className="busy-ring"),
-        html.Div("working…", className="busy-txt"),
-        html.Div("0%", id="busy-pct", className="busy-pct"),
-        html.Div("click to dismiss", className="busy-hint"),
-    ], id="busy", className="busy-off", n_clicks=0),
-    dcc.Interval(id="busy-tick", interval=350, disabled=True, n_intervals=0, max_intervals=200),
 ])
-
-
-BUSY_SHOW = ["liqm-run", "cred-run", "prosp-search", "prosp-go", "prosp-run-file",
-             "ksa-send", "xac-send", "xap-send", "xam-send"]
-BUSY_HIDE_STORES = ["liqm-store", "cred-store", "prosp-store", "ksa-hist", "xac-hist", "xap-hist", "xam-hist"]
-BUSY_HIDE_STATUS = ["liqm-status", "cred-status", "prosp-status"]
-
-app.clientside_callback(
-    "function(){var c=dash_clientside.callback_context;"
-    "if(!c.triggered||!c.triggered.length){return window.dash_clientside.no_update;}"
-    "var id=c.triggered[0].prop_id.split('.')[0];"
-    "var show=" + json.dumps(BUSY_SHOW) + ";"
-    "if(show.indexOf(id)>=0){return ['busy-on',false,0,'0%'];}"
-    "return ['busy-off',true,0,'0%'];}",
-    [Output("busy", "className"), Output("busy-tick", "disabled"),
-     Output("busy-tick", "n_intervals"), Output("busy-pct", "children")],
-    [Input(b, "n_clicks") for b in BUSY_SHOW]
-    + [Input(s, "data") for s in BUSY_HIDE_STORES]
-    + [Input(s, "children") for s in BUSY_HIDE_STATUS]
-    + [Input("busy", "n_clicks")],
-    prevent_initial_call=True)
-
-app.clientside_callback(
-    "function(n,cur){var v=parseInt(cur)||0;v=v+Math.max(1,Math.floor((96-v)*0.10));"
-    "if(v>96){v=96;}return v+'%';}",
-    Output("busy-pct", "children", allow_duplicate=True),
-    Input("busy-tick", "n_intervals"), State("busy-pct", "children"),
-    prevent_initial_call=True)
 
 
 @app.callback([Output(f"sec-{val}", "style") for _, val, _ in TOP_TABS], Input("top-tabs", "value"))
@@ -2705,18 +3286,18 @@ def update_credit(src: str, xk: str, yk: str):
 
 
 @app.callback(Output("cred-store", "data"), Output("cred-status", "children"),
-              Input("cred-run", "n_clicks"), State("cred-input", "value"), State("cred-mode", "value"),
+              Input("cred-run", "n_clicks"), State("iss-ticker", "value"), State("iss-mode", "value"),
               prevent_initial_call=True)
-def run_credit(_n, company, mode_lbl):
-    if not company or not company.strip():
-        return no_update, "Please enter an issuer."
+def run_credit(_n, ticker, mode_lbl):
+    if not ticker or not ticker.strip():
+        return no_update, "Enter a Bloomberg ticker above."
     try:
         cm = _cm()
     except Exception as ex:
         return no_update, f"Engine not loadable: {ex}"
     mode = CREDIT_MODES.get(mode_lbl, "corp")
     try:
-        data = cm._issuer_job(company.strip(), mode, False)
+        data = cm._issuer_job(_bbg_name(ticker), mode, False)
     except Exception as ex:
         return no_update, f"Analysis failed: {ex}"
     data.setdefault("_mode", mode)
@@ -2763,18 +3344,36 @@ def credit_pdf(n, data):
         return dcc.send_bytes(pdf, filename=f"{name}.pdf"), f"Folder unavailable — downloaded instead ({ex})."
 
 
+_MODEL_CACHE = _JsonCache(HERE / ".cache" / "model.json")
+
+
 @app.callback(Output("liqm-store", "data"), Output("liqm-status", "children"),
-              Input("liqm-run", "n_clicks"), State("liqm-input", "value"), State("liqm-mode", "value"),
-              prevent_initial_call=True)
-def run_liquidity(_n, company, mode_lbl):
-    if not company or not company.strip():
-        return no_update, "Please enter an issuer."
+              Input("liqm-run", "n_clicks"), State("iss-ticker", "value"), State("iss-mode", "value"),
+              State("iss-src", "value"), prevent_initial_call=True)
+def run_liquidity(_n, ticker, mode_lbl, source):
+    ticker = (ticker or "").strip()
+    if not ticker:
+        return no_update, "Enter a ticker or issuer name above."
     mode = CREDIT_MODES.get(mode_lbl, "corp")
+    bloomberg = (source or "Bloomberg").startswith("Bloomberg") and mode == "corp"
+    ck = ("bbg" if bloomberg else "ai", mode, ticker.lower())
+    cached = _MODEL_CACHE.get(ck)
+    if cached is not None:
+        return {"mode": mode, "issuer": ticker, "data": cached}, "done · cached"
     try:
-        data = _credit_metrics_job(company.strip(), mode)
+        if bloomberg:
+            try:
+                data, src = _bbg_metrics(ticker, mode), "Bloomberg"
+            except Exception:
+                log.exception("bbg metrics failed for %s — AI fallback", ticker)
+                data, src = _credit_metrics_job(_bbg_name(ticker), mode), "AI (BBG fallback)"
+        else:
+            data, src = _credit_metrics_job(_bbg_name(ticker), mode), "AI"
     except Exception as ex:
-        return no_update, f"Model failed: {ex}"
-    return {"mode": mode, "issuer": company.strip(), "data": data}, "done"
+        log.exception("model failed for %s", ticker)
+        return no_update, f"Failed: {ex}"
+    _MODEL_CACHE.set(ck, data)
+    return {"mode": mode, "issuer": ticker, "data": data}, f"done · {src}"
 
 
 @app.callback(Output("liqm-output", "children"), Input("liqm-store", "data"))
@@ -2784,6 +3383,7 @@ def render_liquidity(store):
     try:
         return build_credit_model(store["mode"], store["data"], store.get("issuer", ""))
     except Exception as ex:
+        log.exception("model render failed")
         return _cm_error(f"Model render failed: {ex}")
 
 
@@ -2801,13 +3401,25 @@ def stage_prospectus(contents, filenames):
 
 @app.callback(Output("prosp-confirm", "children"), Output("prosp-cand", "data"),
               Output("prosp-status", "children"), Input("prosp-search", "n_clicks"),
-              State("prosp-issuer", "value"), prevent_initial_call=True)
-def find_prospectus(_n, issuer):
-    if not issuer or not issuer.strip():
-        return no_update, no_update, "Please enter an issuer."
+              State("iss-ticker", "value"), State("iss-src", "value"), prevent_initial_call=True)
+def find_prospectus(_n, ticker, source):
+    if not ticker or not ticker.strip():
+        return no_update, no_update, "Enter a ticker or issuer above."
+    if (source or "Bloomberg").startswith("Bloomberg"):
+        try:
+            bonds = _bbg_bonds(ticker)
+        except Exception as ex:
+            return _cm_error(f"Bloomberg lookup failed: {ex}"), no_update, ""
+        if bonds:
+            return html.Div([
+                html.Div("Outstanding bonds (Bloomberg) — terms, seniority, spread", style=ds.LABEL_STYLE),
+                html.Div(_bond_table(bonds), style={"marginTop": "8px"}),
+                note("For the covenant / recovery deep-dive, drag the offering memorandum PDF below.")],
+            ), None, f"{len(bonds)} bonds · Bloomberg"
+        return _cm_error("No bonds found on Bloomberg — try a bond ticker, or attach the OM PDF."), None, "none"
     try:
         cm = _cm()
-        cand = search_prospectus(cm, issuer.strip())
+        cand = search_prospectus(cm, _bbg_name(ticker))
     except Exception as ex:
         return _cm_error(f"Search failed: {ex}"), no_update, ""
     if not cand or not cand.get("found"):
@@ -2825,15 +3437,16 @@ def _run_prospectus(cm, issuer, files):
 
 
 @app.callback(Output("prosp-store", "data"),
-              Input("prosp-go", "n_clicks"), State("prosp-issuer", "value"),
+              Input("prosp-go", "n_clicks"), State("iss-ticker", "value"),
               State("prosp-cand", "data"), prevent_initial_call=True)
-def analyze_prospectus_found(_n, issuer, cand):
+def analyze_prospectus_found(_n, ticker, cand):
     try:
         cm = _cm()
     except Exception as ex:
         return {"_error": f"Engine not loadable: {ex}"}
+    name = _bbg_name(ticker)
     url = (cand or {}).get("url", "")
-    label = f"{(issuer or '').strip()} — use this prospectus: {url}" if url else (issuer or "").strip()
+    label = f"{name} — use this prospectus: {url}" if url else name
     try:
         return _run_prospectus(cm, label, None)
     except Exception as ex:
@@ -2841,15 +3454,26 @@ def analyze_prospectus_found(_n, issuer, cand):
 
 
 @app.callback(Output("prosp-store", "data", allow_duplicate=True),
-              Input("prosp-run-file", "n_clicks"), State("prosp-issuer", "value"),
+              Input("prosp-run-file", "n_clicks"), State("iss-ticker", "value"),
               State("prosp-files-data", "data"), prevent_initial_call=True)
-def analyze_prospectus_file(_n, issuer, files):
+def analyze_prospectus_file(_n, ticker, files):
     if not files:
         return no_update
     try:
-        return _run_prospectus(_cm(), (issuer or "").strip(), files)
+        return _run_prospectus(_cm(), _bbg_name(ticker), files)
     except Exception as ex:
         return {"_error": f"Analysis failed: {ex}"}
+
+
+@app.callback(Output("iss-name", "children"), Input("iss-ticker", "value"))
+def _resolve_iss_name(ticker):
+    ticker = (ticker or "").strip()
+    if not ticker:
+        return ""
+    try:
+        return "→ " + _bbg_name(ticker)
+    except Exception:
+        return ""
 
 
 @app.callback(Output("prosp-output", "children"), Input("prosp-store", "data"))
